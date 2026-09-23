@@ -8,23 +8,18 @@ Resultados:      protegidos por senha (RESULTADOS_SENHA).
 
 import hmac
 import os
-import sqlite3
-from contextlib import closing
 from datetime import datetime
 
 import pandas as pd
 import streamlit as st
+import gspread
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Votação Interclasses", page_icon="🏆", layout="centered")
 
 # ----------------------------------------------------------------------------
 # Configuração
 # ----------------------------------------------------------------------------
-DB_PATH = os.environ.get(
-    "VOTOS_DB",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "votos.db"),
-)
-
 SALAS = {
     "6º ano": ["6A", "6B", "6C", "6D"],
     "7º ano": ["7A", "7B", "7C"],
@@ -48,51 +43,62 @@ def faixa_da_sala(sala: str) -> str:
 
 
 def senha_dos_resultados() -> str:
-    """Lê a senha de st.secrets, depois da variável de ambiente."""
+    """Lê a senha da Área do Professor."""
     try:
-        return str(st.secrets["RESULTADOS_SENHA"])
+        return str(st.secrets["admin"]["password"])
     except Exception:
-        return os.environ.get("RESULTADOS_SENHA", "interclasses2026")
+        try:
+            return str(st.secrets["RESULTADOS_SENHA"])
+        except Exception:
+            return os.environ.get("RESULTADOS_SENHA", "interclasses2026")
 
 
 # ----------------------------------------------------------------------------
-# Banco de dados (SQLite)
+# Google Planilhas
 # ----------------------------------------------------------------------------
-def conectar() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS votos (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            sala       TEXT NOT NULL,
-            faixa      TEXT NOT NULL,
-            modalidade TEXT NOT NULL,
-            genero     TEXT NOT NULL,
-            criado_em  TEXT NOT NULL
-        )
-        """
-    )
-    return con
+COLUNAS_VOTOS = ["sala", "faixa", "modalidade", "genero", "criado_em"]
 
+@st.cache_resource
+def cliente_google():
+    info = dict(st.secrets["gcp_service_account"])
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credenciais = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(credenciais)
+
+def planilha_votos():
+    cfg = st.secrets["google_sheets"]
+    return cliente_google().open_by_key(str(cfg["spreadsheet_id"])).worksheet(str(cfg.get("worksheet", "Página1")))
+
+def preparar_planilha() -> None:
+    ws = planilha_votos()
+    cabecalho = ws.row_values(1)
+    if not cabecalho:
+        ws.append_row(COLUNAS_VOTOS, value_input_option="RAW")
+    elif cabecalho[:5] != COLUNAS_VOTOS:
+        raise RuntimeError("Cabeçalho esperado: " + " | ".join(COLUNAS_VOTOS))
 
 def salvar_voto(sala: str, modalidade: str, genero: str) -> None:
-    with closing(conectar()) as con, con:
-        con.execute(
-            "INSERT INTO votos (sala, faixa, modalidade, genero, criado_em) VALUES (?, ?, ?, ?, ?)",
-            (sala, faixa_da_sala(sala), modalidade, genero, datetime.now().isoformat(timespec="seconds")),
-        )
-
+    preparar_planilha()
+    planilha_votos().append_row(
+        [sala, faixa_da_sala(sala), modalidade, genero, datetime.now().isoformat(timespec="seconds")],
+        value_input_option="RAW",
+    )
 
 def carregar_votos() -> pd.DataFrame:
-    with closing(conectar()) as con:
-        return pd.read_sql_query(
-            "SELECT sala, faixa, modalidade, genero, criado_em FROM votos", con
-        )
-
+    preparar_planilha()
+    registros = planilha_votos().get_all_records(expected_headers=COLUNAS_VOTOS)
+    if not registros:
+        return pd.DataFrame(columns=COLUNAS_VOTOS)
+    df = pd.DataFrame(registros)
+    return df.reindex(columns=COLUNAS_VOTOS, fill_value="")
 
 def zerar_votos() -> None:
-    with closing(conectar()) as con, con:
-        con.execute("DELETE FROM votos")
+    ws = planilha_votos()
+    ws.clear()
+    ws.append_row(COLUNAS_VOTOS, value_input_option="RAW")
 
 
 # ----------------------------------------------------------------------------
@@ -155,6 +161,7 @@ ss.setdefault("autenticado", False)
 
 def novo_voto() -> None:
     ss.update(passo=1, ano=None, sala=None, modalidade=None, genero=None)
+    ss.pop("erro_salvar", None)
 
 
 def escolher_ano(ano: str) -> None:
@@ -178,8 +185,13 @@ def voltar() -> None:
 
 
 def salvar() -> None:
-    salvar_voto(ss.sala, ss.modalidade, ss.genero)
-    ss.passo = 5
+    try:
+        salvar_voto(ss.sala, ss.modalidade, ss.genero)
+        ss.pop("erro_salvar", None)
+        ss.passo = 5
+    except Exception as exc:
+        ss.erro_salvar = "Não foi possível registrar o voto no Google Planilhas. Tente novamente ou avise o professor."
+        print(f"Erro ao salvar voto: {exc!r}")
 
 
 def ir_para(tela: str) -> None:
@@ -264,6 +276,9 @@ def tela_votar() -> None:
                 on_click=escolher_genero, args=(g,),
             )
 
+        if ss.get("erro_salvar"):
+            st.error(ss.erro_salvar)
+
         if ss.genero:
             st.markdown(
                 f'<div class="resumo">Sala <b>{ss.sala}</b> · '
@@ -333,7 +348,14 @@ def tela_resultados() -> None:
         st.rerun()
 
     st.title("📊 Resultados")
-    df = carregar_votos()
+    try:
+        df = carregar_votos()
+    except Exception as exc:
+        st.error("Não foi possível carregar os votos do Google Planilhas.")
+        st.caption("Verifique os Secrets, o nome da aba e o compartilhamento da planilha.")
+        print(f"Erro ao carregar votos: {exc!r}")
+        st.button("Sair", key="sair_erro", type="tertiary", on_click=sair_dos_resultados)
+        return
     st.caption(f"Total de votos registrados: {len(df)}")
 
     for faixa in (FAIXA_FUND_2, FAIXA_FUND_3):
